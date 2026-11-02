@@ -12,17 +12,42 @@ import bcrypt
 from sqlalchemy import create_engine, Column, String, Text, Integer
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from ratelimit import limits, sleep_and_retry
-import openai
+from openai import OpenAI
+from dotenv import load_dotenv
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 import gymnasium as gym
 import getpass
 
+# Load ENCRYPTION_KEY and OPENAI_API_KEY from the .env file
+load_dotenv()
+
 # Set decimal precision for money calculations
 getcontext().prec = 10
 
-# Configure OpenAI API key from environment
-openai.api_key = os.getenv('OPENAI_API_KEY')
+# OpenAI client (optional: AI features are skipped if no key is set)
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY')) if os.getenv('OPENAI_API_KEY') else None
+
+
+def ask_openai(prompt: str, max_tokens: int = 60) -> str:
+    """Send a short prompt to OpenAI and return the reply text."""
+    response = openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def load_config() -> dict:
+    """Load config.json, falling back to config_sample.json if it doesn't exist."""
+    for name in ('config.json', 'config_sample.json'):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    raise FileNotFoundError('No config.json or config_sample.json found.')
 
 # Set up SQLite database
 engine = create_engine('sqlite:///bank.db', connect_args={'check_same_thread': False})
@@ -130,8 +155,10 @@ class BankAccount:
                 raise ValueError("ENCRYPTION_KEY not set in environment variables")
             cipher = Fernet(key.encode())
             record.encrypted_balance = cipher.encrypt(str(self._balance).encode()).decode()
-            if self._hashed_pin and not record.hashed_pin:
+            # Keep PIN and currency in sync if an account with this name already exists
+            if self._hashed_pin:
                 record.hashed_pin = self._hashed_pin.decode()
+            record.base_currency = self._base_currency
             session.add(record)
             session.commit()
         except Exception as e:
@@ -176,11 +203,9 @@ class BankAccount:
         return amount * Decimal(str(rate))
 
     def _detect_anomaly(self, amount: float, currency: str) -> str:
-        config_path = os.path.join(os.getcwd(), 'config.json')
         alert = ''
         try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
+            config = load_config()
             data = np.array(config['anomaly_model_data'])
             model = IsolationForest(contamination=0.1, random_state=42)
             model.fit(data)
@@ -188,14 +213,13 @@ class BankAccount:
             currency_index = currency_mapping.get(currency.upper(), 0)
             if model.predict([[amount, currency_index]])[0] == -1:
                 alert = ' ⚠️ Suspicious transaction detected.⚠️'
-                if openai.api_key:
+                if openai_client:
                     try:
-                        response = openai.Completion.create(
-                            model="text-davinci-003",
-                            prompt=f"Explain why a {amount} {currency} transaction might be fraudulent.",
-                            max_tokens=50
+                        insight = ask_openai(
+                            f"In one short sentence, explain why a {amount} {currency} "
+                            f"transaction might be flagged as unusual by a bank."
                         )
-                        alert += f" AI Insight: {response.choices[0].text.strip()}"
+                        alert += f" AI Insight: {insight}"
                     except Exception as e:
                         alert += f" (AI insight unavailable: {str(e)})"
         except Exception:
@@ -204,24 +228,19 @@ class BankAccount:
         return alert
 
     def _get_recommendation(self) -> str:
-        if not openai.api_key:
+        if not openai_client:
             return ''
         try:
-            response = openai.Completion.create(
-                model="text-davinci-003",
-                prompt=f"Suggest a banking action for user {self._owner} with balance {self.balance} in {self._base_currency}.",
-                max_tokens=50
+            tip = ask_openai(
+                f"In one short sentence, suggest a sensible banking action for someone "
+                f"with a balance of {self.balance:.2f} {self._base_currency}."
             )
-            return f" AI Recommendation: {response.choices[0].text.strip()}🤖"
+            return f" AI Recommendation: {tip}🤖"
         except Exception:
             return ''
 
     def _auto_suggest_transfer(self, other: 'BankAccount') -> str:
-        config_path = os.path.join(os.getcwd(), 'config.json')
         try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-            
             class BankingEnv(gym.Env):
                 def __init__(self):
                     super(BankingEnv, self).__init__()
@@ -391,10 +410,8 @@ def get_exchange_rate(from_currency: str, to_currency: str) -> float:
         data = response.json()
         return data['rates'].get(to_currency, 1.0)
     except (requests.RequestException, KeyError):
-        config_path = os.path.join(os.getcwd(), 'config.json')
         try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
+            config = load_config()
             return config.get('exchange_rates', {}).get(f'{from_currency}_to_{to_currency}', 1.0)
         except (FileNotFoundError, json.JSONDecodeError):
             raise ValueError('Exchange rate unavailable. Please check API or config.')
